@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>لوحة إدارة الباركود</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:Tahoma,Arial,sans-serif;background:#f3f6fb;color:#172033}
+.wrap{max-width:1100px;margin:0 auto;padding:28px 16px}
+.card{background:#fff;border-radius:20px;padding:26px;box-shadow:0 10px 30px #17203314;margin-bottom:18px}
+h1{margin-top:0;font-size:28px}h2{font-size:21px}.muted{color:#667085}.icon{font-size:45px}
+.admin-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.qr{display:block;width:min(360px,100%);margin:20px auto}
+input[type=file]{width:100%;padding:15px;border:1px solid #d0d5dd;border-radius:12px;margin:15px 0}
+.button{display:inline-block;border:0;border-radius:12px;padding:13px 18px;background:#1456d9;color:white;text-decoration:none;cursor:pointer;font-size:15px}
+.button.secondary{background:#eef4ff;color:#1456d9}
+.status{margin-top:18px;padding:14px;background:#f7f9fc;border-radius:12px}
+.badge{display:inline-block;padding:7px 10px;background:#e9f7ef;border-radius:20px;color:#18794e}
+.topline{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+#timer{font-size:22px;font-weight:bold}
+.viewer{border:1px solid #e1e5eb;border-radius:14px;overflow:hidden;background:#fff}
+.viewer iframe{display:block;width:100%;height:70vh;min-height:500px;border:0}
+.warning{padding:12px;border-radius:10px;background:#fff8e6;color:#7a5b00}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:11px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap}
+code{background:#f0f2f5;padding:3px 6px;border-radius:5px;direction:ltr;display:inline-block}
+@media(max-width:750px){.admin-grid{grid-template-columns:1fr}.card{padding:20px}.viewer iframe{min-height:420px;height:60vh}}
+</style>
+</head>
+<body><main class="wrap">
+    <div class="admin-grid">
+      <section class="card">
+        <h1>الباركود الثابت</h1>
+        <p class="muted">الرابط لا يتغير: <code>http://localhost:3001/q</code></p>
+        <img class="qr" src="data:image/png;base64,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" alt="QR Code">
+        <a class="button secondary" href="/admin/qr.png">فتح QR كصورة</a>
+      </section>
+
+      <section class="card">
+        <h1>رفع مرفق جديد</h1>
+        <p>رفع ملف جديد يعيد تفعيل نفس الباركود تلقائيًا.</p>
+        <form action="/admin/upload" method="post" enctype="multipart/form-data">
+          <input type="file" name="attachment" required>
+          <button class="button" type="submit">رفع وتفعيل المرفق</button>
+        </form>
+        <div class="status"><strong>الحالة الحالية:</strong> 🔴 مستخدم</div>
+        <p><strong>الملف:</strong> Ø§Ø³ØªÙØ§Ø±Ø©_Ø¥ÙÙØ§Ø¯_MOL-MISSION-2026-2027 (8).pdf</p>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>آخر المرفقات</h2>
+      <div class="table-wrap"><table>
+      <tr><th>الملف</th><th>الحالة</th><th>الرفع</th><th>الفتح</th><th>الانتهاء</th></tr>
+      <tr>
+        <td>Ø§Ø³ØªÙØ§Ø±Ø©_Ø¥ÙÙØ§Ø¯_MOL-MISSION-2026-2027 (8).pdf</td>
+        <td>claimed</td>
+        <td>١٩‏/٨‏/٢٠٢٦، ٧:٤٢:١٨ ص</td>
+        <td>١٩‏/٨‏/٢٠٢٦، ٧:٤٣:٣٢ ص</td>
+        <td>١٩‏/٨‏/٢٠٢٦، ٧:٤٨:٣٢ ص</td>
+      </tr><tr>
+        <td>Ø§Ø³ØªÙØ§Ø±Ø©_Ø¥ÙÙØ§Ø¯_MOL-MISSION-2026-2027 (7).pdf</td>
+        <td>expired</td>
+        <td>١٩‏/٨‏/٢٠٢٦، ٧:٤١:٠٩ ص</td>
+        <td>-</td>
+        <td>-</td>
+      </tr><tr>
+        <td>ØªÙØ±ÙØ± ÙÙÙ ÙØ§Ø¨ØªÙØ¨ Ø§ÙØ§Ø¹ÙØ§Ù.pdf</td>
+        <td>expired</td>
+        <td>١٨‏/٨‏/٢٠٢٦، ١:١٣:٢٨ م</td>
+        <td>١٨‏/٨‏/٢٠٢٦، ١:١٣:٣٢ م</td>
+        <td>١٨‏/٨‏/٢٠٢٦، ١:١٨:٣٢ م</td>
+      </tr><tr>
+        <td>ØªÙØ±ÙØ± ÙÙÙ ÙØ§Ø¨ØªÙØ¨ Ø§ÙØ§Ø¹ÙØ§Ù.pdf</td>
+        <td>expired</td>
+        <td>١٨‏/٨‏/٢٠٢٦، ١٢:٥٢:٠٢ م</td>
+        <td>١٨‏/٨‏/٢٠٢٦، ١:١٠:٢٣ م</td>
+        <td>١٨‏/٨‏/٢٠٢٦، ١:١٥:٢٣ م</td>
+      </tr>
+      </table></div>
+    </section>
+  </main></body></html>

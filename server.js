@@ -8,6 +8,7 @@ const crypto = require("crypto");
 
 const app = express();
 app.disable("x-powered-by");
+app.enable("trust proxy");
 
 const ROOT = __dirname;
 
@@ -25,14 +26,19 @@ if (fs.existsSync(envPath)) {
         if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
           val = val.slice(1, -1);
         }
-        process.env[key] = val;
+        if (process.env[key] === undefined) {
+          process.env[key] = val;
+        }
       }
     }
   }
 }
 
 const PORT = Number(process.env.PORT || 3001);
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+let rawBaseUrl = (process.env.BASE_URL || "https://docshare-9gvm.onrender.com").trim().replace(/\/+$/, "");
+rawBaseUrl = rawBaseUrl.replace(/\/(admin|q|view)$/, "");
+const BASE_URL = rawBaseUrl;
+
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "Admin123";
 const ACCESS_MINUTES = Number(process.env.ACCESS_MINUTES || 5);
@@ -113,14 +119,34 @@ function parseCookies(req) {
   return out;
 }
 
-function setCookie(res, name, value, maxAgeSeconds) {
-  res.setHeader("Set-Cookie",
-    `${name}=${encodeURIComponent(value)}; Max-Age=${maxAgeSeconds}; Path=/; HttpOnly; SameSite=Strict`);
+function isReqSecure(req) {
+  return req.secure || req.headers["x-forwarded-proto"] === "https" || BASE_URL.startsWith("https://");
 }
 
-function clearCookie(res, name) {
-  res.setHeader("Set-Cookie", `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict`);
+function setCookie(res, name, value, maxAgeSeconds, isSecure = false) {
+  const secureFlag = isSecure ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `${name}=${encodeURIComponent(value)}; Max-Age=${maxAgeSeconds}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`
+  );
 }
+
+function clearCookie(res, name, isSecure = false) {
+  const secureFlag = isSecure ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secureFlag}`);
+}
+
+// Redirect HTTP to HTTPS in production & set modern security headers
+app.use((req, res, next) => {
+  const proto = req.headers["x-forwarded-proto"];
+  if (proto && proto !== "https") {
+    return res.redirect(301, `https://${req.headers.host}${req.url}`);
+  }
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
 
 function adminAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -165,13 +191,24 @@ app.get("/", (_req, res) => {
 });
 
 // Fixed QR target. This URL never changes.
-app.get("/q", async (_req, res) => {
+app.get("/q", async (req, res) => {
+  const isSecure = isReqSecure(req);
+
+  // Prevent prefetch/preview bots from consuming the one-time token
+  const isPrefetch =
+    req.headers["purpose"] === "prefetch" ||
+    req.headers["sec-purpose"] === "prefetch" ||
+    req.headers["x-purpose"] === "preview" ||
+    req.headers["x-moz"] === "prefetch";
+  if (isPrefetch) {
+    return res.status(200).send("OK");
+  }
+
   const current = await get(`SELECT * FROM attachments ORDER BY id DESC LIMIT 1`);
   if (!current) return res.send(page("لا يوجد مرفق", `
     <div class="card"><h1>لا يوجد مرفق حالي</h1><p>يرجى رفع مرفق من لوحة الإدارة.</p></div>
   `));
 
-  const claimed = current.status === "claimed" || current.status === "expired";
   if (current.status === "claimed" && current.expires_at && new Date(current.expires_at) <= new Date()) {
     await run(`UPDATE attachments SET status='expired' WHERE id=? AND status='claimed'`, [current.id]);
   }
@@ -189,18 +226,23 @@ app.get("/q", async (_req, res) => {
     `, [now.toISOString(), expires.toISOString(), sha256(token), latest.id]);
 
     if (result.changes === 1) {
-      setCookie(res, "qr_access", token, ACCESS_MINUTES * 60);
-      return res.redirect("/view");
+      setCookie(res, "qr_access", token, ACCESS_MINUTES * 60, isSecure);
+      return res.redirect(`/view?token=${encodeURIComponent(token)}`);
     }
   }
 
-  const cookies = parseCookies(_req);
-  if (cookies.qr_access) {
+  // If already claimed, check if current visitor has the valid token
+  const cookies = parseCookies(req);
+  const existingToken = req.query.token || cookies.qr_access;
+  if (existingToken) {
     const valid = await get(`
       SELECT * FROM attachments
       WHERE id=? AND status='claimed' AND claim_token_hash=? AND expires_at > ?
-    `, [latest.id, sha256(cookies.qr_access), new Date().toISOString()]);
-    if (valid) return res.redirect("/view");
+    `, [latest.id, sha256(existingToken), new Date().toISOString()]);
+    if (valid) {
+      setCookie(res, "qr_access", existingToken, ACCESS_MINUTES * 60, isSecure);
+      return res.redirect(`/view?token=${encodeURIComponent(existingToken)}`);
+    }
   }
 
   return res.status(410).send(page("المرفق غير متاح", `
@@ -214,22 +256,26 @@ app.get("/q", async (_req, res) => {
 });
 
 app.get("/view", async (req, res) => {
+  const isSecure = isReqSecure(req);
   const cookies = parseCookies(req);
-  if (!cookies.qr_access) return res.redirect("/q");
+  const token = req.query.token || cookies.qr_access;
+  if (!token) return res.redirect("/q");
 
   const item = await get(`
     SELECT * FROM attachments
     WHERE status='claimed' AND claim_token_hash=? AND expires_at > ?
     ORDER BY id DESC LIMIT 1
-  `, [sha256(cookies.qr_access), new Date().toISOString()]);
+  `, [sha256(token), new Date().toISOString()]);
 
   if (!item) {
-    clearCookie(res, "qr_access");
+    clearCookie(res, "qr_access", isSecure);
     return res.status(410).send(page("انتهى الوصول", `
       <div class="card"><div class="icon">⏱️</div><h1>انتهت مدة الوصول</h1>
       <p>يرجى انتظار رفع مرفق جديد.</p></div>
     `));
   }
+
+  setCookie(res, "qr_access", token, ACCESS_MINUTES * 60, isSecure);
 
   const secondsLeft = Math.max(0, Math.floor((new Date(item.expires_at) - new Date()) / 1000));
   res.send(page("عرض المرفق", `
@@ -239,7 +285,7 @@ app.get("/view", async (req, res) => {
       <h1>${escapeHtml(item.filename)}</h1>
       <p class="muted">الوقت المتبقي: <strong><span id="count">${secondsLeft}</span> ثانية</strong></p>
       <div class="viewer">
-        <iframe src="/file/${item.id}" title="المرفق"></iframe>
+        <iframe src="/file/${item.id}?token=${encodeURIComponent(token)}" title="المرفق"></iframe>
       </div>
       <p class="warning">هذا الوصول مؤقت ومخصص لأول مستخدم فتح الباركود.</p>
     </div>
@@ -249,8 +295,8 @@ app.get("/view", async (req, res) => {
       const t = document.getElementById("timer");
       const timer = setInterval(() => {
         s--;
-        c.textContent = Math.max(s,0);
-        t.textContent = Math.max(s,0);
+        if (c) c.textContent = Math.max(s,0);
+        if (t) t.textContent = Math.max(s,0);
         if (s <= 0) {
           clearInterval(timer);
           location.href = "/q";
@@ -262,12 +308,13 @@ app.get("/view", async (req, res) => {
 
 app.get("/file/:id", async (req, res) => {
   const cookies = parseCookies(req);
-  if (!cookies.qr_access) return res.status(403).send("Access denied");
+  const token = req.query.token || cookies.qr_access;
+  if (!token) return res.status(403).send("Access denied");
 
   const item = await get(`
     SELECT * FROM attachments
     WHERE id=? AND status='claimed' AND claim_token_hash=? AND expires_at > ?
-  `, [req.params.id, sha256(cookies.qr_access), new Date().toISOString()]);
+  `, [req.params.id, sha256(token), new Date().toISOString()]);
 
   if (!item) return res.status(403).send("Access denied or expired");
 
@@ -284,7 +331,8 @@ app.get("/file/:id", async (req, res) => {
 app.get("/admin", adminAuth, async (_req, res) => {
   const current = await get(`SELECT * FROM attachments ORDER BY id DESC LIMIT 1`);
   const history = await all(`SELECT * FROM attachments ORDER BY id DESC LIMIT 20`);
-  const qrData = await QRCode.toDataURL(`${BASE_URL}/q`, { width: 360, margin: 2 });
+  const qrTarget = `${BASE_URL}/q`;
+  const qrData = await QRCode.toDataURL(qrTarget, { width: 360, margin: 2 });
 
   const statusText = current
     ? current.status === "available" ? "🟢 جاهز للاستخدام"
@@ -296,9 +344,12 @@ app.get("/admin", adminAuth, async (_req, res) => {
     <div class="admin-grid">
       <section class="card">
         <h1>الباركود الثابت</h1>
-        <p class="muted">الرابط لا يتغير: <code>${escapeHtml(BASE_URL)}/q</code></p>
+        <p class="muted">الرابط لا يتغير: <code>${escapeHtml(qrTarget)}</code></p>
         <img class="qr" src="${qrData}" alt="QR Code">
-        <a class="button secondary" href="/admin/qr.png">فتح QR كصورة</a>
+        <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+          <a class="button secondary" href="/admin/qr.png" download="qr.png">تحميل QR كصورة</a>
+          <a class="button secondary" href="${escapeHtml(qrTarget)}" target="_blank">فتح الرابط للتجربة</a>
+        </div>
       </section>
 
       <section class="card">
@@ -330,7 +381,8 @@ app.get("/admin", adminAuth, async (_req, res) => {
 });
 
 app.get("/admin/qr.png", adminAuth, async (_req, res) => {
-  const png = await QRCode.toBuffer(`${BASE_URL}/q`, { width: 1000, margin: 3 });
+  const qrTarget = `${BASE_URL}/q`;
+  const png = await QRCode.toBuffer(qrTarget, { width: 1000, margin: 3 });
   res.type("png").send(png);
 });
 
@@ -370,7 +422,7 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running at ${BASE_URL}`);
+  console.log(`Server running at ${BASE_URL} (Port: ${PORT})`);
 });
 
 function page(title, body) {
