@@ -73,6 +73,18 @@ db.serialize(() => {
       status TEXT NOT NULL DEFAULT 'available'
     )
   `);
+
+  // Auto-heal existing filenames with corrupted/latin1-mangled Arabic text
+  db.all("SELECT id, filename FROM attachments WHERE filename LIKE '%Ø%' OR filename LIKE '%Ù%'", (err, rows) => {
+    if (!err && rows && rows.length > 0) {
+      for (const r of rows) {
+        const fixed = decodeFilename(r.filename);
+        if (fixed && fixed !== r.filename) {
+          db.run("UPDATE attachments SET filename = ? WHERE id = ?", [fixed, r.id]);
+        }
+      }
+    }
+  });
 });
 
 function run(sql, params = []) {
@@ -114,6 +126,27 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
+}
+
+// Safely decode Arabic filenames that Multer/Busboy may have read as latin1/ISO-8859-1
+function decodeFilename(name) {
+  if (!name) return "";
+  try {
+    if (name.includes("Ø") || name.includes("Ù") || /[\u00C0-\u00FF]/.test(name)) {
+      const recovered = Buffer.from(name, "latin1").toString("utf8");
+      if (!recovered.includes("\uFFFD")) {
+        return recovered;
+      }
+    }
+  } catch {}
+  return name;
+}
+
+function formatFileSize(bytes) {
+  if (!bytes || isNaN(bytes)) return "";
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 function parseCookies(req) {
@@ -241,6 +274,28 @@ app.get("/admin/logout", (req, res) => {
   return res.redirect("/admin/login");
 });
 
+// Live status endpoint for Admin auto-update / real-time tracking
+app.get("/admin/api/status", adminAuth, async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  const current = await get(`SELECT * FROM attachments ORDER BY id DESC LIMIT 1`);
+  if (!current) {
+    return res.json({ id: 0, status: "none", filename: "" });
+  }
+
+  if (current.status === "claimed" && current.expires_at && new Date(current.expires_at) <= new Date()) {
+    await run(`UPDATE attachments SET status='expired' WHERE id=? AND status='claimed'`, [current.id]);
+    current.status = "expired";
+  }
+
+  res.json({
+    id: current.id,
+    status: current.status,
+    filename: decodeFilename(current.filename),
+    claimed_at: current.claimed_at,
+    expires_at: current.expires_at
+  });
+});
+
 // Fixed QR target. This URL never changes.
 app.get("/q", async (req, res) => {
   const isSecure = isReqSecure(req);
@@ -329,17 +384,38 @@ app.get("/view", async (req, res) => {
   setCookie(res, "qr_access", token, ACCESS_MINUTES * 60, isSecure);
 
   const secondsLeft = Math.max(0, Math.floor((new Date(item.expires_at) - new Date()) / 1000));
+  const displayName = decodeFilename(item.filename);
+
   res.send(page("عرض المرفق", `
     <div class="card">
-      <div class="topline"><span class="badge">وصول مخصص لشخص واحد</span>
-      <span id="timer">${secondsLeft}</span></div>
-      <h1>${escapeHtml(item.filename)}</h1>
-      <p class="muted">الوقت المتبقي: <strong><span id="count">${secondsLeft}</span> ثانية</strong></p>
-      <div class="viewer">
-        <iframe src="/file/${item.id}?token=${encodeURIComponent(token)}" title="المرفق"></iframe>
+      <div class="topline">
+        <span class="badge">🔒 وصول مخصص لشخص واحد</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="muted" style="font-size:14px">الوقت المتبقي:</span>
+          <span id="timer" style="font-size:20px;font-weight:bold;color:#d92d20;background:#fef3f2;padding:4px 12px;border-radius:10px">${secondsLeft}</span>
+        </div>
       </div>
-      <p class="warning">هذا الوصول مؤقت ومخصص لأول مستخدم فتح الباركود.</p>
+
+      <h1 style="word-break:break-word;margin:14px 0 6px;font-size:24px">${escapeHtml(displayName)}</h1>
+      <p class="muted" style="margin:0 0 16px;font-size:14px">الوقت المتبقي: <strong><span id="count">${secondsLeft}</span> ثانية</strong> &bull; الحجم: <strong>${formatFileSize(item.size)}</strong></p>
+
+      <!-- أزرار التحميل والعرض المباشر للهاتف والكمبيوتر -->
+      <div class="action-buttons">
+        <a class="button download-btn" href="/file/${item.id}?token=${encodeURIComponent(token)}&download=1" download="${escapeHtml(displayName)}">
+          📥 تحميل المرفق (تنزيل)
+        </a>
+        <a class="button secondary view-full-btn" href="/file/${item.id}?token=${encodeURIComponent(token)}" target="_blank">
+          ↗️ فتح في نافذة مستقلة
+        </a>
+      </div>
+
+      <div class="viewer">
+        <iframe src="/file/${item.id}?token=${encodeURIComponent(token)}" title="${escapeHtml(displayName)}"></iframe>
+      </div>
+
+      <p class="warning" style="margin-top:16px">⚠️ هذا الوصول مؤقت ومخصص لأول شخص قام بمسح الباركود، وينتهي بانتهاء الوقت المتبقي.</p>
     </div>
+
     <script>
       let s = ${secondsLeft};
       const c = document.getElementById("count");
@@ -372,8 +448,12 @@ app.get("/file/:id", async (req, res) => {
   const full = path.join(UPLOAD_DIR, path.basename(item.stored_name));
   if (!fs.existsSync(full)) return res.status(404).send("File not found");
 
+  const cleanName = decodeFilename(item.filename);
+  const isDownload = req.query.download === "1";
+  const disposition = isDownload ? "attachment" : "inline";
+
   res.setHeader("Content-Type", item.mime_type || "application/octet-stream");
-  res.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(item.filename)}`);
+  res.setHeader("Content-Disposition", `${disposition}; filename*=UTF-8''${encodeURIComponent(cleanName)}`);
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
   res.setHeader("Pragma", "no-cache");
   res.sendFile(full);
@@ -391,9 +471,16 @@ app.get("/admin", adminAuth, async (_req, res) => {
       : "⚫ منتهي"
     : "لا يوجد";
 
+  const currentDisplayFilename = current ? decodeFilename(current.filename) : "";
+
   res.send(page("لوحة إدارة الباركود", `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px">
-      <div style="font-size:22px;font-weight:bold;color:#1456d9">لوحة إدارة الباركود</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:12px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div style="font-size:22px;font-weight:bold;color:#1456d9">لوحة إدارة الباركود</div>
+        <div class="live-indicator">
+          <span class="live-dot"></span> التحديث التلقائي مفعّل
+        </div>
+      </div>
       <a class="button secondary" href="/admin/logout" style="width:auto;padding:8px 18px;font-size:14px">تسجيل الخروج 🚪</a>
     </div>
 
@@ -416,7 +503,7 @@ app.get("/admin", adminAuth, async (_req, res) => {
           <button class="button" type="submit">رفع وتفعيل المرفق</button>
         </form>
         <div class="status"><strong>الحالة الحالية:</strong> ${statusText}</div>
-        ${current ? `<p><strong>الملف:</strong> ${escapeHtml(current.filename)}</p>` : ""}
+        ${current ? `<p><strong>الملف:</strong> ${escapeHtml(currentDisplayFilename)}</p>` : ""}
       </section>
     </div>
 
@@ -425,7 +512,7 @@ app.get("/admin", adminAuth, async (_req, res) => {
       <div class="table-wrap"><table>
       <tr><th>الملف</th><th>الحالة</th><th>الرفع</th><th>الفتح</th><th>الانتهاء</th></tr>
       ${history.map(x => `<tr>
-        <td>${escapeHtml(x.filename)}</td>
+        <td>${escapeHtml(decodeFilename(x.filename))}</td>
         <td>${x.status}</td>
         <td>${new Date(x.uploaded_at).toLocaleString("ar-OM")}</td>
         <td>${x.claimed_at ? new Date(x.claimed_at).toLocaleString("ar-OM") : "-"}</td>
@@ -433,6 +520,41 @@ app.get("/admin", adminAuth, async (_req, res) => {
       </tr>`).join("")}
       </table></div>
     </section>
+
+    <script>
+      let currentStatus = "${current ? current.status : 'none'}";
+      let currentId = ${current ? current.id : 0};
+
+      async function checkLiveStatus() {
+        try {
+          const res = await fetch("/admin/api/status?t=" + Date.now(), { cache: "no-store" });
+          if (res.ok) {
+            const data = await res.json();
+            // Automatically reload the page when status changes (e.g. from available to claimed) or new file is uploaded
+            if (data.status !== currentStatus || data.id !== currentId) {
+              try {
+                // Gentle audio tone notification
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+                osc.frequency.setValueAtTime(880, ctx.currentTime + 0.12);
+                gain.gain.setValueAtTime(0.2, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.35);
+              } catch (e) {}
+              setTimeout(() => location.reload(), 300);
+            }
+          }
+        } catch (e) {}
+      }
+
+      // Check status every 2.5 seconds
+      setInterval(checkLiveStatus, 2500);
+    </script>
   `));
 });
 
@@ -445,6 +567,14 @@ app.get("/admin/qr.png", adminAuth, async (_req, res) => {
 app.post("/admin/upload", adminAuth, upload.single("attachment"), async (req, res) => {
   if (!req.file) return res.status(400).send("لم يتم اختيار ملف.");
   try {
+    let originalname = req.file.originalname;
+    try {
+      const recovered = Buffer.from(req.file.originalname, "latin1").toString("utf8");
+      if (!recovered.includes("\uFFFD")) {
+        originalname = recovered;
+      }
+    } catch {}
+
     const old = await get(`SELECT * FROM attachments ORDER BY id DESC LIMIT 1`);
     // Make previous cycle unavailable immediately.
     if (old) {
@@ -456,7 +586,7 @@ app.post("/admin/upload", adminAuth, upload.single("attachment"), async (req, re
       (filename, stored_name, mime_type, size, uploaded_at, status)
       VALUES (?, ?, ?, ?, ?, 'available')
     `, [
-      req.file.originalname,
+      originalname,
       req.file.filename,
       req.file.mimetype || "application/octet-stream",
       req.file.size,
@@ -562,14 +692,22 @@ input[type=file]{width:100%;padding:15px;border:1px solid #d0d5dd;border-radius:
 .button.secondary{background:#eef4ff;color:#1456d9}
 .status{margin-top:18px;padding:14px;background:#f7f9fc;border-radius:12px}
 .badge{display:inline-block;padding:7px 10px;background:#e9f7ef;border-radius:20px;color:#18794e}
+.live-indicator{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:#18794e;background:#e9f7ef;padding:6px 14px;border-radius:20px;font-weight:bold}
+.live-dot{width:9px;height:9px;background-color:#18794e;border-radius:50%;display:inline-block;animation:pulse 1.8s infinite}
+@keyframes pulse{0%{transform:scale(0.9);box-shadow:0 0 0 0 rgba(24,121,78,0.7)}70%{transform:scale(1);box-shadow:0 0 0 7px rgba(24,121,78,0)}100%{transform:scale(0.9);box-shadow:0 0 0 0 rgba(24,121,78,0)}}
 .topline{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
 #timer{font-size:22px;font-weight:bold}
+.action-buttons{display:flex;gap:12px;margin:16px 0 20px;flex-wrap:wrap}
+.download-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#1456d9;color:#fff;font-weight:bold;padding:13px 22px;border-radius:12px;text-decoration:none;font-size:15px;box-shadow:0 4px 12px rgba(20,86,217,.25);width:auto}
+.download-btn:hover{background:#0e46b8}
+.view-full-btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;width:auto;padding:13px 20px;font-size:15px}
 .viewer{border:1px solid #e1e5eb;border-radius:14px;overflow:hidden;background:#fff}
 .viewer iframe{display:block;width:100%;height:70vh;min-height:500px;border:0}
 .warning{padding:12px;border-radius:10px;background:#fff8e6;color:#7a5b00}
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:11px;border-bottom:1px solid #eee;text-align:right;white-space:nowrap}
 code{background:#f0f2f5;padding:3px 6px;border-radius:5px;direction:ltr;display:inline-block}
 @media(max-width:750px){.admin-grid{grid-template-columns:1fr}.card{padding:20px}.viewer iframe{min-height:420px;height:60vh}}
+@media(max-width:650px){.action-buttons{flex-direction:column}.download-btn,.view-full-btn{width:100%;text-align:center}}
 </style>
 </head>
 <body><main class="wrap">${body}</main></body></html>`;
