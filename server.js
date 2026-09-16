@@ -207,17 +207,27 @@ function isReqSecure(req) {
   return req.secure || req.headers["x-forwarded-proto"] === "https" || BASE_URL.startsWith("https://");
 }
 
+function appendCookie(res, cookieStr) {
+  const prev = res.getHeader("Set-Cookie");
+  if (!prev) {
+    res.setHeader("Set-Cookie", cookieStr);
+  } else if (Array.isArray(prev)) {
+    res.setHeader("Set-Cookie", [...prev, cookieStr]);
+  } else {
+    res.setHeader("Set-Cookie", [prev, cookieStr]);
+  }
+}
+
 function setCookie(res, name, value, maxAgeSeconds, isSecure = false) {
   const secureFlag = isSecure ? "; Secure" : "";
-  res.setHeader(
-    "Set-Cookie",
-    `${name}=${encodeURIComponent(value)}; Max-Age=${maxAgeSeconds}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`
-  );
+  const cookieStr = `${name}=${encodeURIComponent(value)}; Max-Age=${maxAgeSeconds}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`;
+  appendCookie(res, cookieStr);
 }
 
 function clearCookie(res, name, isSecure = false) {
   const secureFlag = isSecure ? "; Secure" : "";
-  res.setHeader("Set-Cookie", `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secureFlag}`);
+  const cookieStr = `${name}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/; HttpOnly; SameSite=Lax${secureFlag}`;
+  appendCookie(res, cookieStr);
 }
 
 function createSessionToken(user) {
@@ -327,7 +337,13 @@ app.get("/", (_req, res) => {
 // Admin login page
 app.get("/admin/login", (req, res) => {
   const cookies = parseCookies(req);
-  if (cookies.user_session || cookies.admin_session === ADMIN_SECRET) {
+  let loggedIn = false;
+  if (cookies.user_session && verifySessionToken(cookies.user_session)) {
+    loggedIn = true;
+  } else if (cookies.admin_session === ADMIN_SECRET) {
+    loggedIn = true;
+  }
+  if (loggedIn) {
     return res.redirect("/admin");
   }
   const error = req.query.error ? "اسم المستخدم أو كلمة المرور غير صحيحة" : "";
