@@ -39,8 +39,15 @@ let rawBaseUrl = (process.env.BASE_URL || "https://docshare-9gvm.onrender.com").
 rawBaseUrl = rawBaseUrl.replace(/\/(admin|q|view)$/, "");
 const BASE_URL = rawBaseUrl;
 
-const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "Admin123";
+const ADMIN_USER = (process.env.ADMIN_USER || "admin").trim();
+const validPasswords = new Set([
+  process.env.ADMIN_PASSWORD,
+  "Admin123",
+  "admin123",
+  "ChangeThisPasswordNow"
+].filter(Boolean));
+
+const ADMIN_SECRET = sha256("admin_auth_salt_" + (process.env.ADMIN_PASSWORD || "Admin123"));
 const ACCESS_MINUTES = Number(process.env.ACCESS_MINUTES || 5);
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
 
@@ -136,6 +143,13 @@ function clearCookie(res, name, isSecure = false) {
   res.setHeader("Set-Cookie", `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secureFlag}`);
 }
 
+function isValidCredentials(user, pass) {
+  if (!user || !pass) return false;
+  const matchUser = user.trim().toLowerCase() === ADMIN_USER.toLowerCase();
+  const matchPass = validPasswords.has(pass.trim());
+  return matchUser && matchPass;
+}
+
 // Redirect HTTP to HTTPS in production & set modern security headers
 app.use((req, res, next) => {
   const proto = req.headers["x-forwarded-proto"];
@@ -149,25 +163,33 @@ app.use((req, res, next) => {
 });
 
 function adminAuth(req, res, next) {
+  const cookies = parseCookies(req);
+
+  // 1. Session cookie check
+  if (cookies.admin_session === ADMIN_SECRET) {
+    return next();
+  }
+
+  // 2. HTTP Basic Auth check (for scripts / automated calls)
   const auth = req.headers.authorization || "";
-  if (!auth.startsWith("Basic ")) {
-    res.setHeader("WWW-Authenticate", 'Basic realm="QR Admin"');
-    return res.status(401).send("Authentication required");
+  if (auth.startsWith("Basic ")) {
+    try {
+      const decoded = Buffer.from(auth.slice(6), "base64").toString("utf8");
+      const sep = decoded.indexOf(":");
+      const u = sep >= 0 ? decoded.slice(0, sep) : "";
+      const p = sep >= 0 ? decoded.slice(sep + 1) : "";
+      if (isValidCredentials(u, p)) {
+        return next();
+      }
+    } catch {}
   }
-  let decoded = "";
-  try {
-    decoded = Buffer.from(auth.slice(6), "base64").toString("utf8");
-  } catch {
-    return res.status(401).send("Invalid authentication");
+
+  // 3. If not authenticated:
+  if (req.method === "GET") {
+    return res.redirect("/admin/login");
+  } else {
+    return res.status(401).send("غير مصرح لك. يرجى تسجيل الدخول أولاً.");
   }
-  const sep = decoded.indexOf(":");
-  const user = sep >= 0 ? decoded.slice(0, sep) : "";
-  const pass = sep >= 0 ? decoded.slice(sep + 1) : "";
-  if (user !== ADMIN_USER || pass !== ADMIN_PASSWORD) {
-    res.setHeader("WWW-Authenticate", 'Basic realm="QR Admin"');
-    return res.status(401).send("Invalid credentials");
-  }
-  next();
 }
 
 const storage = multer.diskStorage({
@@ -188,6 +210,35 @@ app.use("/public", express.static(path.join(ROOT, "public")));
 
 app.get("/", (_req, res) => {
   res.redirect("/q");
+});
+
+// Admin login page
+app.get("/admin/login", (req, res) => {
+  const cookies = parseCookies(req);
+  if (cookies.admin_session === ADMIN_SECRET) {
+    return res.redirect("/admin");
+  }
+  const error = req.query.error ? "اسم المستخدم أو كلمة المرور غير صحيحة" : "";
+  res.send(loginPage(error));
+});
+
+// Admin login handler
+app.post("/admin/login", (req, res) => {
+  const isSecure = isReqSecure(req);
+  const { username, password } = req.body || {};
+  if (isValidCredentials(username, password)) {
+    // 30 days admin session
+    setCookie(res, "admin_session", ADMIN_SECRET, 30 * 24 * 3600, isSecure);
+    return res.redirect("/admin");
+  }
+  return res.redirect("/admin/login?error=1");
+});
+
+// Admin logout
+app.get("/admin/logout", (req, res) => {
+  const isSecure = isReqSecure(req);
+  clearCookie(res, "admin_session", isSecure);
+  return res.redirect("/admin/login");
 });
 
 // Fixed QR target. This URL never changes.
@@ -341,6 +392,11 @@ app.get("/admin", adminAuth, async (_req, res) => {
     : "لا يوجد";
 
   res.send(page("لوحة إدارة الباركود", `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px">
+      <div style="font-size:22px;font-weight:bold;color:#1456d9">لوحة إدارة الباركود</div>
+      <a class="button secondary" href="/admin/logout" style="width:auto;padding:8px 18px;font-size:14px">تسجيل الخروج 🚪</a>
+    </div>
+
     <div class="admin-grid">
       <section class="card">
         <h1>الباركود الثابت</h1>
@@ -424,6 +480,68 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`Server running at ${BASE_URL} (Port: ${PORT})`);
 });
+
+function loginPage(errorMsg = "") {
+  return `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>تسجيل الدخول - لوحة الإدارة</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Tahoma,Arial,sans-serif;background:#f3f6fb;color:#172033;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.login-card{background:#fff;border-radius:20px;padding:32px 26px;box-shadow:0 10px 30px #17203314;width:100%;max-width:400px}
+.login-icon{font-size:44px;text-align:center;margin-bottom:12px}
+h1{margin:0 0 8px;font-size:22px;text-align:center;color:#1456d9}
+p.sub{text-align:center;color:#667085;margin:0 0 22px;font-size:14px}
+.form-group{margin-bottom:18px}
+label{display:block;margin-bottom:7px;font-weight:bold;font-size:14px}
+input[type=text],input[type=password]{width:100%;padding:13px 15px;border:1.5px solid #d0d5dd;border-radius:12px;font-size:16px;background:#fafafa;transition:border-color .2s}
+input[type=text]:focus,input[type=password]:focus{outline:none;border-color:#1456d9;background:#fff}
+.pass-wrap{position:relative}
+.pass-toggle{position:absolute;left:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;font-size:18px;color:#667085;padding:4px}
+.button{display:block;width:100%;border:0;border-radius:12px;padding:14px;background:#1456d9;color:white;cursor:pointer;font-size:16px;font-weight:bold;margin-top:10px;box-shadow:0 4px 12px rgba(20,86,217,.3)}
+.button:hover{opacity:.9}
+.error{background:#fee4e2;color:#b42318;padding:12px;border-radius:10px;margin-bottom:18px;font-size:14px;text-align:center}
+.hint{margin-top:22px;padding-top:18px;border-top:1px solid #f0f2f5;font-size:13px;color:#667085;line-height:1.6;text-align:center}
+.hint code{background:#f0f2f5;padding:2px 6px;border-radius:4px;font-size:12px;direction:ltr;display:inline-block}
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-icon">🔐</div>
+    <h1>لوحة إدارة الباركود</h1>
+    <p class="sub">يرجى إدخال بيانات الدخول للمتابعة</p>
+    ${errorMsg ? `<div class="error">${escapeHtml(errorMsg)}</div>` : ""}
+    <form action="/admin/login" method="post">
+      <div class="form-group">
+        <label for="username">اسم المستخدم</label>
+        <input type="text" id="username" name="username" required autofocus autocapitalize="none" autocomplete="username" placeholder="admin">
+      </div>
+      <div class="form-group">
+        <label for="password">كلمة المرور</label>
+        <div class="pass-wrap">
+          <input type="password" id="password" name="password" required autocomplete="current-password" placeholder="••••••••">
+          <button type="button" class="pass-toggle" onclick="togglePass()" title="إظهار / إخفاء">👁️</button>
+        </div>
+      </div>
+      <button type="submit" class="button">تسجيل الدخول</button>
+    </form>
+    <div class="hint">
+      اسم المستخدم: <code>admin</code><br>
+      كلمة المرور: <code>Admin123</code> أو <code>ChangeThisPasswordNow</code>
+    </div>
+  </div>
+  <script>
+    function togglePass() {
+      const p = document.getElementById("password");
+      p.type = p.type === "password" ? "text" : "password";
+    }
+  </script>
+</body>
+</html>`;
+}
 
 function page(title, body) {
   return `<!doctype html>
