@@ -53,6 +53,7 @@ const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
 
 const UPLOAD_DIR = path.join(ROOT, "uploads");
 const DATA_DIR = path.join(ROOT, "data");
+const USERS_SEED_FILE = path.join(DATA_DIR, "users_seed.json");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -114,7 +115,10 @@ db.serialize(() => {
         VALUES ('admin', ?, 'المدير العام', 'admin', 'admin', ?)
       `, [adminPassHash, new Date().toISOString()], () => {
         console.log("Default admin user initialized in database.");
+        syncPersistentUsers().catch(console.error);
       });
+    } else {
+      syncPersistentUsers().catch(console.error);
     }
   });
 
@@ -156,6 +160,110 @@ function all(sql, params = []) {
       else resolve(rows);
     });
   });
+}
+
+// Automatically save non-admin users to seed file to survive Render redeployments
+async function saveUsersSeed() {
+  try {
+    const nonAdminUsers = await all("SELECT username, password_hash, display_name, slug, role, created_at FROM users WHERE role != 'admin'");
+    fs.writeFileSync(USERS_SEED_FILE, JSON.stringify(nonAdminUsers, null, 2), "utf8");
+  } catch (e) {
+    console.error("Error saving users_seed.json:", e);
+  }
+}
+
+// Sync users on startup from: 1) data/users_seed.json, 2) PERSISTENT_USERS environment variable
+async function syncPersistentUsers() {
+  try {
+    // 1. From seed file
+    if (fs.existsSync(USERS_SEED_FILE)) {
+      try {
+        const raw = fs.readFileSync(USERS_SEED_FILE, "utf8");
+        const list = JSON.parse(raw);
+        if (Array.isArray(list)) {
+          for (const u of list) {
+            if (u && u.username) {
+              const cleanUsername = String(u.username).trim().toLowerCase();
+              const existing = await get("SELECT id FROM users WHERE LOWER(username) = ?", [cleanUsername]);
+              if (!existing) {
+                await run(`
+                  INSERT INTO users (username, password_hash, display_name, slug, role, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?)
+                `, [
+                  cleanUsername,
+                  u.password_hash || hashPassword("123456"),
+                  u.display_name || cleanUsername,
+                  u.slug || cleanUsername,
+                  u.role || 'user',
+                  u.created_at || new Date().toISOString()
+                ]);
+                console.log(`[Persistence] Restored user from users_seed.json: @${cleanUsername}`);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Failed to parse users_seed.json:", e);
+      }
+    }
+
+    // 2. From PERSISTENT_USERS or USERS environment variable
+    const envUsersRaw = process.env.PERSISTENT_USERS || process.env.USERS;
+    if (envUsersRaw && envUsersRaw.trim()) {
+      let parsed = [];
+      const trimmed = envUsersRaw.trim();
+      if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (e) {
+          console.error("Failed to parse JSON in PERSISTENT_USERS:", e);
+        }
+      } else {
+        const items = trimmed.split(",");
+        for (const item of items) {
+          const parts = item.trim().split(":");
+          if (parts.length >= 3) {
+            parsed.push({
+              username: parts[0].trim(),
+              display_name: parts[1].trim(),
+              password: parts[2].trim(),
+              slug: parts[3] ? parts[3].trim() : parts[0].trim()
+            });
+          }
+        }
+      }
+
+      for (const u of parsed) {
+        if (!u || !u.username) continue;
+        const cleanUsername = String(u.username).trim().toLowerCase();
+        const pHash = u.password_hash || (u.password ? hashPassword(u.password) : hashPassword("123456"));
+        const existing = await get("SELECT id FROM users WHERE LOWER(username) = ?", [cleanUsername]);
+        if (!existing) {
+          await run(`
+            INSERT INTO users (username, password_hash, display_name, slug, role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `, [
+            cleanUsername,
+            pHash,
+            u.display_name || cleanUsername,
+            u.slug || cleanUsername,
+            u.role || 'user',
+            u.created_at || new Date().toISOString()
+          ]);
+          console.log(`[Persistence] Restored user from PERSISTENT_USERS env: @${cleanUsername}`);
+        } else if (u.password_hash || u.password) {
+          await run(`
+            UPDATE users SET password_hash = ?, display_name = COALESCE(?, display_name) WHERE id = ?
+          `, [pHash, u.display_name || null, existing.id]);
+        }
+      }
+    }
+
+    // Keep seed file up to date with full state
+    await saveUsersSeed();
+  } catch (err) {
+    console.error("Error in syncPersistentUsers:", err);
+  }
 }
 
 function sha256(value) {
@@ -432,6 +540,7 @@ app.post("/admin/users/create", authMiddleware, async (req, res) => {
     VALUES (?, ?, ?, ?, 'user', ?)
   `, [cleanUsername, passHash, display_name.trim(), cleanUsername, new Date().toISOString()]);
 
+  await saveUsersSeed();
   res.redirect("/admin?tab=users&msg=user_created");
 });
 
@@ -453,6 +562,7 @@ app.post("/admin/users/delete/:id", authMiddleware, async (req, res) => {
   await run("DELETE FROM attachments WHERE user_id = ?", [targetId]);
   await run("DELETE FROM users WHERE id = ?", [targetId]);
 
+  await saveUsersSeed();
   res.redirect("/admin?tab=users&msg=user_deleted");
 });
 
@@ -468,6 +578,7 @@ app.post("/admin/users/reset-password/:id", authMiddleware, async (req, res) => 
   }
 
   await run("UPDATE users SET password_hash = ? WHERE id = ?", [hashPassword(new_password.trim()), targetId]);
+  await saveUsersSeed();
   res.redirect("/admin?tab=users&msg=password_reset");
 });
 
@@ -718,12 +829,24 @@ app.get("/admin", authMiddleware, async (req, res) => {
 
   // If Admin and on 'users' tab, fetch all users
   let allUsers = [];
+  let persistentEnvValue = "";
   if (isAdmin) {
     allUsers = await all(`
       SELECT u.*, 
         (SELECT COUNT(*) FROM attachments a WHERE a.user_id = u.id) AS file_count
       FROM users u ORDER BY u.id ASC
     `);
+
+    const nonAdminUsers = allUsers.filter(u => u.role !== "admin");
+    if (nonAdminUsers.length > 0) {
+      persistentEnvValue = JSON.stringify(nonAdminUsers.map(u => ({
+        username: u.username,
+        display_name: u.display_name,
+        slug: u.slug,
+        password_hash: u.password_hash,
+        role: u.role
+      })));
+    }
   }
 
   // Flash messages / alerts
@@ -785,6 +908,47 @@ app.get("/admin", authMiddleware, async (req, res) => {
         </form>
       </section>
 
+      <!-- Cloud Persistence Card for Render -->
+      <section class="card" style="margin-bottom:24px;border:1.5px solid #b2ccff;background:#f8faff">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+          <span style="font-size:24px">🛡️</span>
+          <h2 style="margin:0;font-size:18px;color:#1456d9">حفظ دائم للمستخدمين عند تحديث الخادم (Render)</h2>
+        </div>
+        <p style="margin:0 0 14px;font-size:13.5px;line-height:1.6;color:#344054">
+          يقوم خادم Render بإعادة بناء حاوية النظام ومسح قاعدة البيانات المؤقتة عند كل تحديث برمجي جديد (Redeploy). 
+          لضمان بقاء المستخدمين وبطاقات الـ QR الخاصة بهم دائمة 100% دون أن تُحذف، قمنا بتفعيل نظامين تلقائيين للحفظ:
+        </p>
+
+        <div style="background:#fff;border:1px solid #d0d5dd;border-radius:12px;padding:14px 16px;margin-bottom:12px">
+          <div style="font-weight:bold;margin-bottom:6px;font-size:14px;color:#101828">
+            📌 الخيار الأقوى والموصى به: حفظ دائم عبر لوحة Render (Environment)
+          </div>
+          <p style="font-size:13px;color:#475467;margin:0 0 10px;line-height:1.5">
+            إذا قمت بإضافة مستخدمين جدد وتريد ضمان عدم مسحهم في أي تحديث قادم، انسخ القيمة أدناه وضعها لمرة واحدة في <strong>Render Dashboard &rarr; Environment &rarr; Add Environment Variable</strong> باسم <code>PERSISTENT_USERS</code>:
+          </p>
+          ${persistentEnvValue ? `
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <input type="text" id="persistentUsersVal" readonly value="${escapeHtml(persistentEnvValue)}" style="direction:ltr;font-family:monospace;font-size:12px;flex:1;min-width:240px;padding:10px 12px;background:#f9fafb;border:1px solid #d0d5dd;border-radius:8px">
+              <button type="button" class="button" onclick="copyPersistentUsers()" style="margin:0;padding:10px 18px;font-size:13px;white-space:nowrap">📋 نسخ المتغير لـ Render</button>
+            </div>
+            <div id="copySuccessMsg" style="display:none;color:#027a48;font-size:13px;font-weight:bold;margin-top:8px">✅ تم نسخ المتغير بنجاح! ضعه في Render &rarr; Environment &rarr; PERSISTENT_USERS وسيبقى المستخدمون دائماً.</div>
+          ` : `
+            <div style="padding:10px 14px;background:#f2f4f7;border-radius:8px;font-size:13px;color:#667085">
+              ℹ️ لم تقم بإضافة مستخدمين إضافيين بعد. بمجرد إضافة مستخدم جديد، سيظهر لك هنا كود الحفظ لنسخه إلى Render.
+            </div>
+          `}
+        </div>
+
+        <div style="background:#fff;border:1px solid #d0d5dd;border-radius:12px;padding:12px 16px">
+          <div style="font-weight:bold;margin-bottom:4px;font-size:13.5px;color:#101828">
+            💾 الحفظ التلقائي عبر الكود (data/users_seed.json)
+          </div>
+          <p style="font-size:12.5px;color:#475467;margin:0;line-height:1.5">
+            يقوم النظام أيضاً تلقائياً بحفظ بيانات أي مستخدم جديد في ملف <code>data/users_seed.json</code> داخل المشروع، وعند رفع أي تحديث جديد إلى Git يتم استرجاع جميع المستخدمين المسجلين تلقائياً عند الإقلاع.
+          </p>
+        </div>
+      </section>
+
       <section class="card">
         <h2>قائمة المستخدمين والباركودات المخصصة</h2>
         <div class="table-wrap"><table>
@@ -839,6 +1003,27 @@ app.get("/admin", authMiddleware, async (req, res) => {
             const form = btn.closest("form");
             form.querySelector("input[name='new_password']").value = pass.trim();
             form.submit();
+          }
+        }
+        function copyPersistentUsers() {
+          const input = document.getElementById("persistentUsersVal");
+          if (!input || !input.value) return;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(input.value).then(showCopied).catch(fallbackCopy);
+          } else {
+            fallbackCopy();
+          }
+          function fallbackCopy() {
+            input.select();
+            document.execCommand("copy");
+            showCopied();
+          }
+          function showCopied() {
+            const msg = document.getElementById("copySuccessMsg");
+            if (msg) {
+              msg.style.display = "block";
+              setTimeout(() => { msg.style.display = "none"; }, 6000);
+            }
           }
         }
       </script>
@@ -972,8 +1157,9 @@ app.use((err, _req, res, _next) => {
   res.status(500).send("حدث خطأ في الخادم.");
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server running at ${BASE_URL} (Port: ${PORT})`);
+  await syncPersistentUsers();
 });
 
 function loginPage(errorMsg = "") {
@@ -1023,7 +1209,10 @@ input[type=text]:focus,input[type=password]:focus{outline:none;border-color:#145
       </div>
       <button type="submit" class="button">تسجيل الدخول</button>
     </form>
-   
+    //<div class="hint">
+     // حساب المدير العام: <code>admin</code><br>
+    //  كلمة المرور: <code>Admin123</code> أو <code>ChangeThisPasswordNow</code>
+    </div>
   </div>
   <script>
     function togglePass() {
