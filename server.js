@@ -1209,10 +1209,7 @@ input[type=text]:focus,input[type=password]:focus{outline:none;border-color:#145
       </div>
       <button type="submit" class="button">تسجيل الدخول</button>
     </form>
-    //<div class="hint">
-     // حساب المدير العام: <code>admin</code><br>
-    //  كلمة المرور: <code>Admin123</code> أو <code>ChangeThisPasswordNow</code>
-    </div>
+   
   </div>
   <script>
     function togglePass() {
